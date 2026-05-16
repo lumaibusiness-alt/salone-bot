@@ -31,20 +31,35 @@ async function getContesto() {
   };
 }
 
-function buildPrompt(ctx) {
+function buildPrompt(ctx, telefono) {
   const { operatori, servizi, clienti, prenotazioni, oggi } = ctx;
 
   const agendaTxt = prenotazioni.length
-    ? prenotazioni.map(p => `  • ${p.ora_reale} | ${p.operatore_id} | ${p.cliente_nome} | ${p.servizio_nome}`).join('\n')
+    ? prenotazioni.map(p =>
+        `  • ${p.ora_reale} | ${p.operatore_id} | ${p.cliente_nome} | ${p.servizio_nome}`
+      ).join('\n')
     : '  Nessuna prenotazione oggi.';
 
   const clientiTxt = clienti.length
-    ? clienti.map(c => `  • ${c.nome} | tel:${c.telefono} | tipo:${c.tipo} | buffer:${c.buffer_minuti}min`).join('\n')
+    ? clienti.map(c =>
+        `  • ${c.nome} | tel:${c.telefono} | tipo:${c.tipo} | buffer:${c.buffer_minuti}min`
+      ).join('\n')
     : '  Nessun cliente registrato.';
 
-  return `Sei il receptionist AI di un salone di parrucchieri. Oggi è ${oggi}.
+  // Cerca il cliente dal numero di telefono
+  const numeroNormalizzato = telefono.replace('whatsapp:', '');
+  const clienteCorrente = clienti.find(c => c.telefono === numeroNormalizzato);
+  const infoCliente = clienteCorrente
+    ? `CLIENTE CHE STA SCRIVENDO ORA: ${clienteCorrente.nome} | tipo: ${clienteCorrente.tipo} | buffer: ${clienteCorrente.buffer_minuti}min`
+    : `CLIENTE CHE STA SCRIVENDO ORA: numero ${numeroNormalizzato} — NON presente nel database, è un cliente NUOVO.`;
 
-OPERATORI:
+  return `Sei Mario, il receptionist virtuale di un salone di parrucchieri.
+Sei cordiale, naturale e parli come una persona vera — non come un robot.
+Usa un tono amichevole, risposte brevi e dirette. Oggi è ${oggi}.
+
+${infoCliente}
+
+OPERATORI DISPONIBILI:
 ${operatori.map(o => `  • ${o.nome} (id:${o.id}) — turno ${o.turno_inizio}–${o.turno_fine}`).join('\n')}
 
 SERVIZI:
@@ -56,18 +71,45 @@ ${clientiTxt}
 AGENDA OGGI:
 ${agendaTxt}
 
-REGOLE:
-1. Cerca il cliente nel DATABASE CLIENTI per nome o telefono.
-   - Trovato = cliente esistente, salutalo per nome.
-   - Non trovato = cliente nuovo, chiedi nome e telefono, registralo come "affidabile".
-2. Cliente ritardatario: digli orario anticipato di buffer_minuti, salva ora reale. Non dirglielo.
-3. Cliente chiede operatore specifico occupato da cliente senza preferenza: sposta e libera.
-4. Slot ogni 30 min dalle 09:00 alle 18:30. Calcola durata servizio.
+═══ REGOLE FONDAMENTALI ═══
 
-Rispondi SOLO con JSON valido:
+REGOLA 1 — RICONOSCIMENTO CLIENTE
+Guarda "CLIENTE CHE STA SCRIVENDO ORA" qui sopra.
+• Se è un cliente ESISTENTE → salutalo per nome, vai diretto senza chiedergli chi è.
+• Se è un cliente NUOVO → chiedi solo il nome (il numero lo hai già: ${numeroNormalizzato}).
+  Registralo come "affidabile" e procedi con la prenotazione.
+  NON chiedergli mai il numero di telefono — lo hai già.
+
+REGOLA 2 — PREFERENZA OPERATORE
+Dopo aver capito il servizio, chiedi SEMPRE:
+"Hai un operatore preferito tra ${operatori.map(o => o.nome).join(', ')}, o vai bene chiunque?"
+Aspetta la risposta prima di assegnare.
+
+REGOLA 3 — BUFFER RITARDATARI (SEGRETO ASSOLUTO)
+Se il cliente è "ritardatario":
+- Trova lo slot libero reale (es. 10:30)
+- Comunicagli SOLO l'orario anticipato (es. "ti aspettiamo alle 10:00")
+- Salva in agenda l'ora REALE (10:30)
+- Non fare MAI riferimento al buffer, al ritardo, o a orari diversi.
+- Non scrivere mai "buffer" o "ritardatario" nella risposta al cliente.
+
+REGOLA 4 — ASSEGNAZIONE OPERATORI
+a) Cliente senza preferenza → primo operatore libero.
+b) Cliente chiede operatore specifico occupato da cliente SENZA preferenza
+   → sposta quell'appuntamento su altro operatore libero, fallo in autonomia senza dirlo al cliente.
+c) Operatore richiesto occupato da cliente CON preferenza → proponi altro orario.
+
+REGOLA 5 — CANCELLAZIONE
+Se il cliente vuole cancellare, chiedi conferma poi usa azione "cancella".
+
+REGOLA 6 — SLOT DISPONIBILI
+Ogni 30 minuti dalle 09:00 alle 18:30. Calcola durata servizio per non sovrapporre.
+
+REGOLA 7 — FORMATO RISPOSTA (OBBLIGATORIO)
+Rispondi SEMPRE e SOLO con JSON valido, zero testo fuori:
 {
-  "messaggio": "risposta in italiano cordiale",
-  "azione": "nessuna" | "prenota" | "sposta" | "nuovo_cliente",
+  "messaggio": "risposta breve e naturale in italiano",
+  "azione": "nessuna" | "prenota" | "sposta" | "cancella" | "nuovo_cliente",
   "prenotazione": {
     "cliente_nome": "",
     "operatore_id": "",
@@ -80,6 +122,11 @@ Rispondi SOLO con JSON valido:
     "nome": "",
     "telefono": "",
     "tipo": "affidabile"
+  },
+  "cancellazione": {
+    "cliente_nome": "",
+    "operatore_id": "",
+    "ora_reale": "HH:MM"
   }
 }`;
 }
@@ -100,7 +147,7 @@ app.post('/webhook', async (req, res) => {
     const completion = await groq.chat.completions.create({
       model: 'llama-3.3-70b-versatile',
       messages: [
-        { role: 'system', content: buildPrompt(ctx) },
+        { role: 'system', content: buildPrompt(ctx, from) },
         ...conversazioni[from]
       ],
       max_tokens: 800,
@@ -114,16 +161,17 @@ app.post('/webhook', async (req, res) => {
 
     conversazioni[from].push({ role: 'assistant', content: raw });
 
-    // Salva nuovo cliente
+    // Salva nuovo cliente (usa numero WhatsApp reale)
     if (parsed.nuovo_cliente) {
       const nc = parsed.nuovo_cliente;
+      const numeroReale = from.replace('whatsapp:', '');
       await supabase.from('clienti').upsert({
         nome: nc.nome,
-        telefono: nc.telefono,
+        telefono: numeroReale,
         tipo: nc.tipo || 'affidabile',
         buffer_minuti: 0
       }, { onConflict: 'telefono' });
-      console.log('Nuovo cliente salvato:', nc.nome);
+      console.log('Nuovo cliente salvato:', nc.nome, numeroReale);
     }
 
     // Salva prenotazione
@@ -145,6 +193,16 @@ app.post('/webhook', async (req, res) => {
         ora_comunicata: p.ora_comunicata
       });
       console.log('Prenotazione salvata:', p);
+    }
+
+    // Cancella prenotazione
+    if (parsed.azione === 'cancella' && parsed.cancellazione) {
+      const c = parsed.cancellazione;
+      await supabase.from('prenotazioni')
+        .delete()
+        .eq('cliente_nome', c.cliente_nome)
+        .eq('data', ctx.oggi);
+      console.log('Prenotazione cancellata per:', c.cliente_nome);
     }
 
     // Risponde su WhatsApp
